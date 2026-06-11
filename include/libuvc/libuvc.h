@@ -566,7 +566,13 @@ uvc_error_t uvc_wrap(
 uvc_error_t uvc_open(
     uvc_device_t *dev,
     uvc_device_handle_t **devh);
+uvc_error_t uvc_open2(
+    uvc_device_t *dev,
+    uvc_device_handle_t **devh,
+    int camera_idx);
 void uvc_close(uvc_device_handle_t *devh);
+
+int uvc_get_camera_count(uvc_device_t *dev);
 
 uvc_device_t *uvc_get_device(uvc_device_handle_t *devh);
 struct libusb_device_handle *uvc_get_libusb_handle(uvc_device_handle_t *devh);

@@ -246,6 +246,8 @@ struct uvc_stream_handle {
   /* listeners may only access hold*, and only when holding a
    * lock on cb_mutex (probably signaled with cb_cond) */
   uint8_t fid;
+  uint8_t is_bulk;            /** 1 = bulk transfer mode, 0 = isochronous */
+  uint8_t bulk_hdr_done;      /** BULK: frame header already seen, remaining xfers are raw data */
   uint32_t seq, hold_seq;
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;
@@ -280,6 +282,8 @@ struct uvc_device_handle {
   struct uvc_device_info *info;
   struct libusb_transfer *status_xfer;
   uint8_t status_buf[32];
+  /** Set to 1 while status_xfer is active, cleared by callback on cancel/error */
+  int status_xfer_active;
   /** Function to call when we receive status updates from the camera */
   uvc_status_callback_t *status_cb;
   void *status_user_ptr;

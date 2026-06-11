@@ -43,9 +43,11 @@ int uvc_already_open(uvc_context_t *ctx, struct libusb_device *usb_dev);
 void uvc_free_devh(uvc_device_handle_t *devh);
 
 uvc_error_t uvc_get_device_info(uvc_device_handle_t *devh, uvc_device_info_t **info);
+uvc_error_t uvc_get_device_info2(uvc_device_handle_t *devh, uvc_device_info_t **info, int camera_idx);
 void uvc_free_device_info(uvc_device_info_t *info);
 
 uvc_error_t uvc_scan_control(uvc_device_handle_t *devh, uvc_device_info_t *info);
+uvc_error_t uvc_scan_control2(uvc_device_handle_t *devh, uvc_device_info_t *info, int camera_idx);
 uvc_error_t uvc_parse_vc(uvc_device_t *dev,
 			 uvc_device_info_t *info,
 			 const unsigned char *block, size_t block_size);
@@ -313,6 +315,12 @@ uvc_error_t uvc_wrap(
  * @param[out] devh Handle on opened device
  * @return Error opening device or SUCCESS
  */
+static uvc_error_t uvc_open2_internal(
+    uvc_device_t *dev,
+    struct libusb_device_handle *usb_devh,
+    uvc_device_handle_t **devh,
+    int camera_idx);
+
 uvc_error_t uvc_open(
     uvc_device_t *dev,
     uvc_device_handle_t **devh) {
@@ -334,10 +342,40 @@ uvc_error_t uvc_open(
   return ret;
 }
 
+uvc_error_t uvc_open2(
+    uvc_device_t *dev,
+    uvc_device_handle_t **devh,
+    int camera_idx) {
+  uvc_error_t ret;
+  struct libusb_device_handle *usb_devh;
+
+  UVC_ENTER();
+
+  ret = libusb_open(dev->usb_dev, &usb_devh);
+  UVC_DEBUG("libusb_open() = %d", ret);
+
+  if (ret != UVC_SUCCESS) {
+    UVC_EXIT(ret);
+    return ret;
+  }
+
+  ret = uvc_open2_internal(dev, usb_devh, devh, camera_idx);
+  UVC_EXIT(ret);
+  return ret;
+}
+
 static uvc_error_t uvc_open_internal(
     uvc_device_t *dev,
     struct libusb_device_handle *usb_devh,
     uvc_device_handle_t **devh) {
+  return uvc_open2_internal(dev, usb_devh, devh, 0);
+}
+
+static uvc_error_t uvc_open2_internal(
+    uvc_device_t *dev,
+    struct libusb_device_handle *usb_devh,
+    uvc_device_handle_t **devh,
+    int camera_idx) {
   uvc_error_t ret;
   uvc_device_handle_t *internal_devh;
   struct libusb_device_descriptor desc;
@@ -350,7 +388,7 @@ static uvc_error_t uvc_open_internal(
   internal_devh->dev = dev;
   internal_devh->usb_devh = usb_devh;
 
-  ret = uvc_get_device_info(internal_devh, &(internal_devh->info));
+  ret = uvc_get_device_info2(internal_devh, &(internal_devh->info), camera_idx);
 
   if (ret != UVC_SUCCESS)
     goto fail;
@@ -378,6 +416,7 @@ static uvc_error_t uvc_open_internal(
                                    _uvc_status_callback,
                                    internal_devh,
                                    0);
+    internal_devh->status_xfer_active = 1;
     ret = libusb_submit_transfer(internal_devh->status_xfer);
     UVC_DEBUG("libusb_submit_transfer() = %d", ret);
 
@@ -424,6 +463,12 @@ static uvc_error_t uvc_open_internal(
  */
 uvc_error_t uvc_get_device_info(uvc_device_handle_t *devh,
 				uvc_device_info_t **info) {
+  return uvc_get_device_info2(devh, info, 0);
+}
+
+uvc_error_t uvc_get_device_info2(uvc_device_handle_t *devh,
+				uvc_device_info_t **info,
+				int camera_idx) {
   uvc_error_t ret;
   uvc_device_info_t *internal_info;
 
@@ -443,7 +488,7 @@ uvc_error_t uvc_get_device_info(uvc_device_handle_t *devh,
     return UVC_ERROR_IO;
   }
 
-  ret = uvc_scan_control(devh, internal_info);
+  ret = uvc_scan_control2(devh, internal_info, camera_idx);
   if (ret != UVC_SUCCESS) {
     uvc_free_device_info(internal_info);
     UVC_EXIT(ret);
@@ -454,6 +499,28 @@ uvc_error_t uvc_get_device_info(uvc_device_handle_t *devh,
 
   UVC_EXIT(ret);
   return ret;
+}
+
+int uvc_get_camera_count(uvc_device_t *dev) {
+  struct libusb_config_descriptor *config;
+  int count = 0;
+  int i;
+
+  if (libusb_get_config_descriptor(dev->usb_dev, 0, &config) != 0)
+    return 0;
+
+  for (i = 0; i < config->bNumInterfaces; i++) {
+    const struct libusb_interface_descriptor *if_desc =
+        &config->interface[i].altsetting[0];
+    /* Class 14 (0x0E) = Video, SubClass 1 = VideoControl */
+    if ((if_desc->bInterfaceClass == 14 && if_desc->bInterfaceSubClass == 1) ||
+        (if_desc->bInterfaceClass == 255 && if_desc->bInterfaceSubClass == 1)) {
+      count++;
+    }
+  }
+
+  libusb_free_config_descriptor(config);
+  return count;
 }
 
 /**
@@ -1047,9 +1114,14 @@ uvc_error_t uvc_release_if(uvc_device_handle_t *devh, int idx) {
  * @ingroup device
  */
 uvc_error_t uvc_scan_control(uvc_device_handle_t *devh, uvc_device_info_t *info) {
+  return uvc_scan_control2(devh, info, 0);
+}
+
+uvc_error_t uvc_scan_control2(uvc_device_handle_t *devh, uvc_device_info_t *info, int camera_idx) {
   const struct libusb_interface_descriptor *if_desc;
   uvc_error_t parse_ret, ret;
   int interface_idx;
+  int vc_found;
   const unsigned char *buffer;
   size_t buffer_left, block_size;
 
@@ -1057,6 +1129,7 @@ uvc_error_t uvc_scan_control(uvc_device_handle_t *devh, uvc_device_info_t *info)
 
   ret = UVC_SUCCESS;
   if_desc = NULL;
+  vc_found = 0;
 
   uvc_device_descriptor_t* dev_desc;
   int haveTISCamera = 0;
@@ -1069,15 +1142,22 @@ uvc_error_t uvc_scan_control(uvc_device_handle_t *devh, uvc_device_info_t *info)
   }
 
   for (interface_idx = 0; interface_idx < info->config->bNumInterfaces; ++interface_idx) {
-    if_desc = &info->config->interface[interface_idx].altsetting[0];
+    const struct libusb_interface_descriptor *candidate =
+        &info->config->interface[interface_idx].altsetting[0];
 
-    if ( haveTISCamera && if_desc->bInterfaceClass == 255 && if_desc->bInterfaceSubClass == 1) // Video, Control
-      break;
+    int is_vc = 0;
+    if ( haveTISCamera && candidate->bInterfaceClass == 255 && candidate->bInterfaceSubClass == 1)
+      is_vc = 1;
+    if (candidate->bInterfaceClass == 14 && candidate->bInterfaceSubClass == 1)
+      is_vc = 1;
 
-    if (if_desc->bInterfaceClass == 14 && if_desc->bInterfaceSubClass == 1) // Video, Control
-      break;
-
-    if_desc = NULL;
+    if (is_vc) {
+      if (vc_found == camera_idx) {
+        if_desc = candidate;
+        break;
+      }
+      vc_found++;
+    }
   }
 
   if (if_desc == NULL) {
@@ -1726,6 +1806,24 @@ void uvc_close(uvc_device_handle_t *devh) {
   if (devh->streams)
     uvc_stop_streaming(devh);
 
+  // ── 取消 status interrupt transfer 并等待回调完成 ──
+  // 原代码直接 libusb_close() → libusb_free_transfer(status_xfer)，
+  // 不会等待正在传输的 status_xfer 的回调完成。在 Windows WinUSB
+  // 栈上，这可能导致中断端点残留脏状态，影响下次 open。
+  if (devh->status_xfer && devh->status_xfer_active) {
+    libusb_cancel_transfer(devh->status_xfer);
+    // 轮询处理事件直到回调触发并清除 flag，最多 500ms
+    struct timeval tv;
+    for (int i = 0; i < 50 && devh->status_xfer_active; i++) {
+      tv.tv_sec = 0;
+      tv.tv_usec = 10000;  // 10ms
+      libusb_handle_events_timeout(ctx->usb_ctx, &tv);
+    }
+    if (devh->status_xfer_active) {
+      UVC_DEBUG("status_xfer did not cancel within timeout");
+    }
+  }
+
   uvc_release_if(devh, devh->info->ctrl_if.bInterfaceNumber);
 
   /* If we are managing the libusb context and this is the last open device,
@@ -1912,6 +2010,7 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_CANCELLED:
   case LIBUSB_TRANSFER_NO_DEVICE:
     UVC_DEBUG("not processing/resubmitting, status = %d", transfer->status);
+    devh->status_xfer_active = 0;
     UVC_EXIT_VOID();
     return;
   case LIBUSB_TRANSFER_COMPLETED:

@@ -76,6 +76,35 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh);
 static uvc_streaming_interface_t *_uvc_get_stream_if(uvc_device_handle_t *devh, int interface_idx);
 static uvc_stream_handle_t *_uvc_get_stream_by_interface(uvc_device_handle_t *devh, int interface_idx);
 
+static void _uvc_clear_stream_endpoint(uvc_stream_handle_t *strmh, const char *reason) {
+  uint8_t endpoint;
+  int ret;
+
+  if (!strmh || !strmh->stream_if)
+    return;
+
+  endpoint = strmh->stream_if->bEndpointAddress;
+  if (!endpoint)
+    return;
+
+  ret = libusb_clear_halt(strmh->devh->usb_devh, endpoint);
+  fprintf(stderr, "[libuvc] clear_halt(%s) endpoint=0x%02x ret=%d\n",
+          reason ? reason : "stream", endpoint, ret);
+}
+
+static void _uvc_set_stream_interface_alt0(uvc_stream_handle_t *strmh, const char *reason) {
+  int ret;
+
+  if (!strmh || !strmh->stream_if)
+    return;
+
+  ret = libusb_set_interface_alt_setting(strmh->devh->usb_devh,
+                                         strmh->stream_if->bInterfaceNumber,
+                                         0);
+  fprintf(stderr, "[libuvc] set_interface_alt0(%s) interface=%u ret=%d\n",
+          reason ? reason : "stream", strmh->stream_if->bInterfaceNumber, ret);
+}
+
 struct format_table_entry {
   enum uvc_frame_format format;
   uint8_t abstract_fmt;
@@ -595,9 +624,10 @@ uvc_error_t uvc_get_still_ctrl_format_size(
 static int _uvc_stream_params_negotiated(
   uvc_stream_ctrl_t *required,
   uvc_stream_ctrl_t *actual) {
+    // 移除了 dwMaxPayloadTransferSize >= actual->dwMaxPayloadTransferSize 校验
+    // 自研高带宽/非标相机的实际包大小可能超过默认极限值，放宽协商条件
     return required->bFormatIndex == actual->bFormatIndex &&
-    required->bFrameIndex == actual->bFrameIndex &&
-    required->dwMaxPayloadTransferSize >= actual->dwMaxPayloadTransferSize;
+           required->bFrameIndex == actual->bFrameIndex;
 }
 
 /** @internal
@@ -669,12 +699,30 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
   strmh->hold_last_scr = strmh->last_scr;
   strmh->hold_pts = strmh->pts;
   strmh->hold_seq = strmh->seq;
-  
+
   /* swap metadata buffer */
   tmp_buf = strmh->meta_holdbuf;
   strmh->meta_holdbuf = strmh->meta_outbuf;
   strmh->meta_outbuf = tmp_buf;
   strmh->meta_hold_bytes = strmh->meta_got_bytes;
+
+  /* Diagnostic: warn if frame is significantly truncated */
+  {
+    static int frame_count = 0;
+    static int trunc_count = 0;
+    frame_count++;
+    if (strmh->hold_bytes < strmh->cur_ctrl.dwMaxVideoFrameSize) {
+      trunc_count++;
+      if (frame_count <= 5 || frame_count % 100 == 0) {
+        fprintf(stderr, "[libuvc] Frame#%d truncated: %zu / %u bytes (%.1f%%), %d/%d frames truncated\n",
+                frame_count, strmh->hold_bytes, strmh->cur_ctrl.dwMaxVideoFrameSize,
+                strmh->hold_bytes * 100.0 / strmh->cur_ctrl.dwMaxVideoFrameSize,
+                trunc_count, frame_count);
+      }
+    } else if (frame_count <= 5 || frame_count % 100 == 0) {
+      fprintf(stderr, "[libuvc] Frame#%d complete: %zu bytes\n", frame_count, strmh->hold_bytes);
+    }
+  }
 
   pthread_cond_broadcast(&strmh->cb_cond);
   pthread_mutex_unlock(&strmh->cb_mutex);
@@ -684,6 +732,7 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
   strmh->meta_got_bytes = 0;
   strmh->last_scr = 0;
   strmh->pts = 0;
+  strmh->bulk_hdr_done = 0;
 }
 
 /** @internal
@@ -711,6 +760,56 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
   if (payload_len == 0)
     return;
 
+  /* ── BULK mode frame-start header validation ──
+   * USB BULK transfer boundaries do not align with UVC frame boundaries.
+   * After _uvc_swap_buffers, a late transfer containing the previous
+   * frame's tail data may arrive.  At got_bytes==0 we expect a fresh
+   * UVC payload header (bHeaderLength == 12, no error bit).  If the
+   * first byte doesn't match, this is residual data — discard it.
+   * Isochronous and iSight modes are unaffected. */
+  if (strmh->is_bulk && !strmh->devh->is_isight
+      && strmh->got_bytes == 0 && !strmh->bulk_hdr_done) {
+    if (payload_len < 2 || payload[0] != 12 || (payload[1] & 0x40)) {
+      UVC_DEBUG("BULK: discarding non-header xfer at frame start "
+                "(len=%zu, b0=0x%02x, b1=0x%02x)",
+                payload_len, payload[0], payload_len >= 2 ? payload[1] : 0);
+      return;
+    }
+  }
+
+  /* ── BULK mode: after the frame header has been consumed, all subsequent
+   *     transfers for the same frame are raw video data without a header.
+   *
+   *     SAFETY: if a new frame header arrives before the current frame is
+   *     complete (got_bytes < dwMaxVideoFrameSize), the old frame's remaining
+   *     transfers were lost (USB bandwidth / FPGA back-pressure).  Detect this
+   *     by checking whether the incoming payload starts with a valid UVC header
+   *     whose FID bit flipped.  If so, publish the truncated old frame and
+   *     fall through to normal header parsing for the new frame. */
+  if (strmh->is_bulk && (strmh->got_bytes > 0 || strmh->bulk_hdr_done)) {
+
+    if (strmh->got_bytes > 0 && strmh->got_bytes < strmh->cur_ctrl.dwMaxVideoFrameSize
+        && payload_len >= 2
+        && payload[0] == 12                           /* bHeaderLength */
+        && !(payload[1] & 0x40)                       /* no error bit  */
+        && (payload[1] & 0x80)                        /* EOH set       */
+        && (payload[1] & 1) != strmh->fid) {          /* FID flipped   */
+      /* New frame header detected mid-stream — publish truncated old
+       * frame so it can be logged as a drop, then process new header. */
+      fprintf(stderr, "[libuvc] BULK: new header detected with %zu/%u bytes — publishing truncated frame (seq %u)\n",
+              strmh->got_bytes, strmh->cur_ctrl.dwMaxVideoFrameSize, strmh->seq);
+      _uvc_swap_buffers(strmh);
+      strmh->bulk_hdr_done = 0;
+      /* fall through to normal header parsing */
+    } else {
+      header_len = 0;
+      data_len = payload_len;
+      strmh->bulk_hdr_done = 1;  /* stays set until frame swap */
+      header_info = 0;
+      goto copy_data;
+    }
+  }
+
   /* Certain iSight cameras have strange behavior: They send header
    * information in a packet with no image data, and then the following
    * packets have only image data, with no more headers until the next frame.
@@ -735,8 +834,16 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
 
     if (strmh->devh->is_isight)
       data_len = 0;
-    else
+    else {
       data_len = payload_len - header_len;
+      /* BULK mode: detect header-only transfer.
+       * When the device sends the UVC payload header in a separate
+       * USB bulk transfer, the next transfer will be raw video data
+       * without a header.  Mark this so the next call skips header
+       * parsing. */
+      if (data_len == 0 && header_len > 0)
+        strmh->bulk_hdr_done = 1;
+    }
   }
 
   if (header_len < 2) {
@@ -782,13 +889,19 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
     }
   }
 
+copy_data:
   if (data_len > 0) {
     if (strmh->got_bytes + data_len > strmh->cur_ctrl.dwMaxVideoFrameSize)
       data_len = strmh->cur_ctrl.dwMaxVideoFrameSize - strmh->got_bytes; /* Avoid overflow. */
     memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
     strmh->got_bytes += data_len;
-    if (header_info & (1 << 1) || strmh->got_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize) {
-      /* The EOF bit is set, so publish the complete frame */
+    /* Publish frame when data is complete.  In BULK mode the UVC payload
+     * header always has EOF set, but the USB driver may split the physical
+     * transfer — wait for got_bytes to reach dwMaxVideoFrameSize before
+     * publishing, otherwise a late tail transfer would be discarded by the
+     * frame-start guard above.  Isochronous mode uses EOF as-is. */
+    if (strmh->got_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize
+        || ((header_info & (1 << 1)) && !strmh->is_bulk)) {
       _uvc_swap_buffers(strmh);
     }
   }
@@ -1090,6 +1203,7 @@ uvc_error_t uvc_stream_start(
   size_t total_transfer_size = 0;
   struct libusb_transfer *transfer;
   int transfer_id;
+  int submitted_transfers = 0;
 
   ctrl = &strmh->cur_ctrl;
 
@@ -1103,6 +1217,7 @@ uvc_error_t uvc_stream_start(
   strmh->running = 1;
   strmh->seq = 1;
   strmh->fid = 0;
+  strmh->bulk_hdr_done = 0;
   strmh->pts = 0;
   strmh->last_scr = 0;
 
@@ -1119,6 +1234,8 @@ uvc_error_t uvc_stream_start(
     goto fail;
   }
 
+  _uvc_clear_stream_endpoint(strmh, "before-start");
+
   // Get the interface that provides the chosen format and frame configuration
   interface_id = strmh->stream_if->bInterfaceNumber;
   interface = &strmh->devh->info->config->interface[interface_id];
@@ -1126,6 +1243,7 @@ uvc_error_t uvc_stream_start(
   /* A VS interface uses isochronous transfers iff it has multiple altsettings.
    * (UVC 1.5: 2.4.3. VideoStreaming Interface) */
   isochronous = interface->num_altsetting > 1;
+  strmh->is_bulk = !isochronous;
 
   if (isochronous) {
     /* For isochronous streaming, we choose an appropriate altsetting for the endpoint
@@ -1181,9 +1299,11 @@ uvc_error_t uvc_stream_start(
         packets_per_transfer = (ctrl->dwMaxVideoFrameSize +
                                 endpoint_bytes_per_packet - 1) / endpoint_bytes_per_packet;
 
-        /* But keep a reasonable limit: Otherwise we start dropping data */
-        if (packets_per_transfer > 32)
-          packets_per_transfer = 32;
+        /* High-bandwidth cameras need many packets per transfer.
+         * Original limit of 32 was too low for 10MB+ frames at 60FPS,
+         * causing severe packet loss. Raised to 256 for 2560x2048 Gray16. */
+        if (packets_per_transfer > 256)
+          packets_per_transfer = 256;
         
         total_transfer_size = packets_per_transfer * endpoint_bytes_per_packet;
         break;
@@ -1218,19 +1338,69 @@ uvc_error_t uvc_stream_start(
 
       libusb_set_iso_packet_lengths(transfer, endpoint_bytes_per_packet);
     }
+
+    /* ── 诊断日志：打印流启动参数 ── */
+    fprintf(stderr,
+      "[libuvc] ========== Stream Start ==========\n"
+      "[libuvc]   Frame size (dwMaxVideoFrameSize):  %u bytes (%.1f KB)\n"
+      "[libuvc]   Payload limit (dwMaxPayloadTransferSize): %u bytes (%.1f KB)\n"
+      "[libuvc]   Endpoint bytes per packet:          %zu bytes (%.1f KB)\n"
+      "[libuvc]   Packets per transfer:               %zu\n"
+      "[libuvc]   Total per transfer:                 %zu bytes (%.1f KB)\n"
+      "[libuvc]   Transfer buffers:                   %d\n"
+      "[libuvc]   Buffer pool total:                  %.1f MB\n"
+      "[libuvc]   Frame / buffer pool:                %.1f frames\n"
+      "[libuvc] ===================================\n",
+      ctrl->dwMaxVideoFrameSize,
+      ctrl->dwMaxVideoFrameSize / 1024.0,
+      ctrl->dwMaxPayloadTransferSize,
+      ctrl->dwMaxPayloadTransferSize / 1024.0,
+      endpoint_bytes_per_packet,
+      endpoint_bytes_per_packet / 1024.0,
+      packets_per_transfer,
+      total_transfer_size,
+      total_transfer_size / 1024.0,
+      LIBUVC_NUM_TRANSFER_BUFS,
+      total_transfer_size * LIBUVC_NUM_TRANSFER_BUFS / (1024.0 * 1024.0),
+      (total_transfer_size * LIBUVC_NUM_TRANSFER_BUFS) / (double)ctrl->dwMaxVideoFrameSize
+    );
   } else {
+    /* ── Bulk 模式：保持整帧传输，减少 buffer 数量控制内存 ──
+     * 相机每帧只有一个 UVC header（在帧首），不支持分块 header。
+     * 改为通过 LIBUVC_NUM_TRANSFER_BUFS 宏控制 buffer 池大小。
+     */
+    size_t bulk_xfer_size = strmh->cur_ctrl.dwMaxPayloadTransferSize;
+
+    _uvc_set_stream_interface_alt0(strmh, "bulk-before-start");
+    _uvc_clear_stream_endpoint(strmh, "bulk-before-start");
+
     for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS;
         ++transfer_id) {
       transfer = libusb_alloc_transfer(0);
       strmh->transfers[transfer_id] = transfer;
-      strmh->transfer_bufs[transfer_id] = malloc (
-          strmh->cur_ctrl.dwMaxPayloadTransferSize );
-      libusb_fill_bulk_transfer ( transfer, strmh->devh->usb_devh,
+      strmh->transfer_bufs[transfer_id] = malloc(bulk_xfer_size);
+      libusb_fill_bulk_transfer(transfer, strmh->devh->usb_devh,
           format_desc->parent->bEndpointAddress,
           strmh->transfer_bufs[transfer_id],
-          strmh->cur_ctrl.dwMaxPayloadTransferSize, _uvc_stream_callback,
-          ( void* ) strmh, 5000 );
+          bulk_xfer_size, _uvc_stream_callback,
+          (void*) strmh, 5000 );
     }
+
+    /* ── 诊断日志：Bulk 模式参数 ── */
+    fprintf(stderr,
+      "[libuvc] ========== Stream Start (BULK) ==========\n"
+      "[libuvc]   Frame size (dwMaxVideoFrameSize):  %u bytes (%.1f KB)\n"
+      "[libuvc]   Xfer size (dwMaxPayloadTransferSize): %u bytes (%.1f KB)\n"
+      "[libuvc]   Transfer buffers:                   %d\n"
+      "[libuvc]   Buffer pool total:                  %.1f MB\n"
+      "[libuvc] =========================================\n",
+      ctrl->dwMaxVideoFrameSize,
+      ctrl->dwMaxVideoFrameSize / 1024.0,
+      ctrl->dwMaxPayloadTransferSize,
+      ctrl->dwMaxPayloadTransferSize / 1024.0,
+      LIBUVC_NUM_TRANSFER_BUFS,
+      ctrl->dwMaxPayloadTransferSize * LIBUVC_NUM_TRANSFER_BUFS / (1024.0 * 1024.0)
+    );
   }
 
   strmh->user_cb = cb;
@@ -1250,15 +1420,47 @@ uvc_error_t uvc_stream_start(
       UVC_DEBUG("libusb_submit_transfer failed: %d",ret);
       break;
     }
+    submitted_transfers++;
   }
 
-  if ( ret != UVC_SUCCESS && transfer_id >= 0 ) {
-    for ( ; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
-      free ( strmh->transfers[transfer_id]->buffer );
-      libusb_free_transfer ( strmh->transfers[transfer_id]);
-      strmh->transfers[transfer_id] = 0;
+  if (ret != UVC_SUCCESS) {
+    int i;
+
+    strmh->running = 0;
+
+    pthread_mutex_lock(&strmh->cb_mutex);
+
+    for (i = 0; i < submitted_transfers; i++) {
+      if (strmh->transfers[i] != NULL)
+        libusb_cancel_transfer(strmh->transfers[i]);
     }
-    ret = UVC_SUCCESS;
+
+    for (i = submitted_transfers; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+      if (strmh->transfers[i] != NULL) {
+        free(strmh->transfers[i]->buffer);
+        libusb_free_transfer(strmh->transfers[i]);
+        strmh->transfers[i] = NULL;
+      }
+    }
+
+    do {
+      for (i = 0; i < submitted_transfers; i++) {
+        if (strmh->transfers[i] != NULL)
+          break;
+      }
+      if (i == submitted_transfers)
+        break;
+      pthread_cond_wait(&strmh->cb_cond, &strmh->cb_mutex);
+    } while (1);
+
+    pthread_cond_broadcast(&strmh->cb_cond);
+    pthread_mutex_unlock(&strmh->cb_mutex);
+
+    if (strmh->user_cb)
+      pthread_join(strmh->cb_thread, NULL);
+
+    UVC_EXIT(ret);
+    return ret;
   }
 
   UVC_EXIT(ret);
@@ -1520,6 +1722,8 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
   // Kick the user thread awake
   pthread_cond_broadcast(&strmh->cb_cond);
   pthread_mutex_unlock(&strmh->cb_mutex);
+
+  _uvc_clear_stream_endpoint(strmh, "after-stop");
 
   /** @todo stop the actual stream, camera side? */
 
