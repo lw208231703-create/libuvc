@@ -796,8 +796,10 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
         && (payload[1] & 1) != strmh->fid) {          /* FID flipped   */
       /* New frame header detected mid-stream — publish truncated old
        * frame so it can be logged as a drop, then process new header. */
-      fprintf(stderr, "[libuvc] BULK: new header detected with %zu/%u bytes — publishing truncated frame (seq %u)\n",
-              strmh->got_bytes, strmh->cur_ctrl.dwMaxVideoFrameSize, strmh->seq);
+      fprintf(stderr, "[libuvc] BULK: new frame header at %zu/%u bytes (xfer_len=%zu, seq=%u) "
+              "— FPGA started new frame, old frame truncated\n",
+              strmh->got_bytes, strmh->cur_ctrl.dwMaxVideoFrameSize,
+              payload_len, strmh->seq);
       _uvc_swap_buffers(strmh);
       strmh->bulk_hdr_done = 0;
       /* fall through to normal header parsing */
@@ -1365,11 +1367,26 @@ uvc_error_t uvc_stream_start(
       (total_transfer_size * LIBUVC_NUM_TRANSFER_BUFS) / (double)ctrl->dwMaxVideoFrameSize
     );
   } else {
-    /* ── Bulk 模式：保持整帧传输，减少 buffer 数量控制内存 ──
-     * 相机每帧只有一个 UVC header（在帧首），不支持分块 header。
-     * 改为通过 LIBUVC_NUM_TRANSFER_BUFS 宏控制 buffer 池大小。
+    /* ── Bulk 模式传输大小策略 ──
+     *
+     * 关键发现 (2026-07-14 笔记本 XHCI 实测):
+     *   1MB transfer → 10% 丢帧率 (每帧 10 个 transfer 边界 = 10 个丢包点)
+     *   10MB transfer → 4% 丢帧率 (每帧 1 个 transfer 边界 = 1 个丢包点)
+     *
+     * 原因: 每次 bulk transfer 完成 (被 short packet 截断或读满) 后, XHCI 需要
+     * 处理完成中断 → libusb 回调 → resubmit, 这段间隙里 FT602 FIFO (32KB) 无人
+     * 读取, 若 XHCI 调度抖动 > 0.16ms 则 FIFO 溢出 → FPGA 丢数据 → 开新帧。
+     *
+     * 结论: transfer 越大, 边界越少, 丢包越少。使用整帧 transfer (dwMaxPayloadTransferSize)
+     * 配合大量 buffer, 让 XHCI 调度队列始终有 pending transfer 减少间隙。
+     *
+     * 可选: LIBUVC_BULK_XFER_SIZE_OVERRIDE 宏可强制指定 transfer 大小 (不推荐)
      */
+#ifdef LIBUVC_BULK_XFER_SIZE_OVERRIDE
+    size_t bulk_xfer_size = LIBUVC_BULK_XFER_SIZE_OVERRIDE;
+#else
     size_t bulk_xfer_size = strmh->cur_ctrl.dwMaxPayloadTransferSize;
+#endif
 
     _uvc_set_stream_interface_alt0(strmh, "bulk-before-start");
     _uvc_clear_stream_endpoint(strmh, "bulk-before-start");
@@ -1387,20 +1404,30 @@ uvc_error_t uvc_stream_start(
     }
 
     /* ── 诊断日志：Bulk 模式参数 ── */
-    fprintf(stderr,
-      "[libuvc] ========== Stream Start (BULK) ==========\n"
-      "[libuvc]   Frame size (dwMaxVideoFrameSize):  %u bytes (%.1f KB)\n"
-      "[libuvc]   Xfer size (dwMaxPayloadTransferSize): %u bytes (%.1f KB)\n"
-      "[libuvc]   Transfer buffers:                   %d\n"
-      "[libuvc]   Buffer pool total:                  %.1f MB\n"
-      "[libuvc] =========================================\n",
-      ctrl->dwMaxVideoFrameSize,
-      ctrl->dwMaxVideoFrameSize / 1024.0,
-      ctrl->dwMaxPayloadTransferSize,
-      ctrl->dwMaxPayloadTransferSize / 1024.0,
-      LIBUVC_NUM_TRANSFER_BUFS,
-      ctrl->dwMaxPayloadTransferSize * LIBUVC_NUM_TRANSFER_BUFS / (1024.0 * 1024.0)
-    );
+    {
+      double pool_mb = bulk_xfer_size * LIBUVC_NUM_TRANSFER_BUFS / (1024.0 * 1024.0);
+      double xfers_per_frame = ctrl->dwMaxVideoFrameSize > 0
+        ? (double)ctrl->dwMaxVideoFrameSize / bulk_xfer_size : 0;
+      fprintf(stderr,
+        "[libuvc] ========== Stream Start (BULK) ==========\n"
+        "[libuvc]   Frame size:        %u bytes (%.1f KB)\n"
+        "[libuvc]   Device payload:    %u bytes (%.1f KB)\n"
+        "[libuvc]   Actual xfer size:  %zu bytes (%.1f KB)\n"
+        "[libuvc]   Transfer buffers:  %d\n"
+        "[libuvc]   Buffer pool:       %.1f MB\n"
+        "[libuvc]   Xfers per frame:   %.1f\n"
+        "[libuvc] =========================================\n",
+        ctrl->dwMaxVideoFrameSize,
+        ctrl->dwMaxVideoFrameSize / 1024.0,
+        ctrl->dwMaxPayloadTransferSize,
+        ctrl->dwMaxPayloadTransferSize / 1024.0,
+        bulk_xfer_size,
+        bulk_xfer_size / 1024.0,
+        LIBUVC_NUM_TRANSFER_BUFS,
+        pool_mb,
+        xfers_per_frame
+      );
+    }
   }
 
   strmh->user_cb = cb;
