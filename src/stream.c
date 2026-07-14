@@ -40,6 +40,118 @@
 #include "libuvc/libuvc_internal.h"
 #include "errno.h"
 
+/* ── WinUSB RAW_IO 支持 (libusb 1.0.30+, LIBUSB_API_VERSION >= 0x0100010C) ──
+ * RAW_IO 让 bulk read 请求绕过 WinUSB 普通排队层, 直接进入 USB core stack,
+ * 消除普通模式下请求边界的微小空隙 (实测 ~4 MiB 边界导致 FIFO 背压)。
+ */
+#if defined(_WIN32) && defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010C)
+#define UVC_ENABLE_RAW_IO 1
+#endif
+
+struct uvc_raw_io_setup {
+  int enabled;
+  int endpoint_max_packet;
+  int raw_io_max_transfer;
+  size_t submitted_transfer_length;
+};
+
+static int _uvc_align_up_size(size_t value, size_t alignment, size_t *out) {
+  if (alignment == 0 || out == NULL)
+    return LIBUSB_ERROR_INVALID_PARAM;
+  size_t remainder = value % alignment;
+  if (remainder == 0) {
+    *out = value;
+    return LIBUSB_SUCCESS;
+  }
+  *out = value + (alignment - remainder);
+  return LIBUSB_SUCCESS;
+}
+
+static int _uvc_setup_raw_io(
+    libusb_device_handle *usb_handle,
+    uint8_t endpoint,
+    size_t negotiated_payload_size,
+    struct uvc_raw_io_setup *result)
+{
+  libusb_device *usb_device;
+  size_t aligned_length = 0;
+  int max_packet, supports_raw, max_raw_transfer, rc;
+
+  if (usb_handle == NULL || result == NULL)
+    return LIBUSB_ERROR_INVALID_PARAM;
+
+  memset(result, 0, sizeof(*result));
+
+  usb_device = libusb_get_device(usb_handle);
+  if (usb_device == NULL)
+    return LIBUSB_ERROR_NO_DEVICE;
+
+  max_packet = libusb_get_max_packet_size(usb_device, endpoint);
+  if (max_packet <= 0)
+    return max_packet < 0 ? max_packet : LIBUSB_ERROR_OTHER;
+
+  result->endpoint_max_packet = max_packet;
+
+  rc = _uvc_align_up_size(negotiated_payload_size, (size_t)max_packet, &aligned_length);
+  if (rc != LIBUSB_SUCCESS)
+    return rc;
+
+#ifdef UVC_ENABLE_RAW_IO
+  supports_raw = libusb_endpoint_supports_raw_io(usb_handle, endpoint);
+  if (supports_raw < 0)
+    return supports_raw;
+  if (supports_raw == 0)
+    return LIBUSB_ERROR_NOT_SUPPORTED;
+
+  max_raw_transfer = libusb_get_max_raw_io_transfer_size(usb_handle, endpoint);
+  if (max_raw_transfer < 0)
+    return max_raw_transfer;
+
+  result->raw_io_max_transfer = max_raw_transfer;
+
+  if (aligned_length > (size_t)max_raw_transfer) {
+    /* 整帧请求超过 RAW_IO 最大传输长度 — 使用 max_raw_transfer 作为 transfer size。
+     * _uvc_process_payload 的 BULK 模式已支持多 transfer 组装同一帧:
+     *   - 第一个 transfer 含 UVC header (12B), bulk_hdr_done 置位
+     *   - 后续 transfer 为纯像素数据, header_len=0, 累积到 got_bytes
+     *   - got_bytes == dwMaxVideoFrameSize 时 _uvc_swap_buffers 发布完整帧
+     * 每个 RAW_IO transfer 长度必须是 max_packet 整数倍 — max_raw_transfer 通常已对齐 */
+    size_t capped = (size_t)max_raw_transfer;
+    /* 确保 capped 是 max_packet 整数倍 */
+    capped = (capped / (size_t)max_packet) * (size_t)max_packet;
+    if (capped < (size_t)max_packet)
+      return LIBUSB_ERROR_OVERFLOW;
+    aligned_length = capped;
+    fprintf(stderr, "[libuvc] RAW_IO: request capped to %zu bytes (max_raw=%d)\n",
+            aligned_length, max_raw_transfer);
+  }
+
+  rc = libusb_endpoint_set_raw_io(usb_handle, endpoint, 1);
+  if (rc != LIBUSB_SUCCESS)
+    return rc;
+
+  result->enabled = 1;
+  result->submitted_transfer_length = aligned_length;
+  return LIBUSB_SUCCESS;
+#else
+  (void)supports_raw;
+  (void)max_raw_transfer;
+  return LIBUSB_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+static const char *_uvc_speed_name(int speed) {
+  switch (speed) {
+  case LIBUSB_SPEED_LOW: return "Low";
+  case LIBUSB_SPEED_FULL: return "Full";
+  case LIBUSB_SPEED_HIGH: return "High";
+  case LIBUSB_SPEED_SUPER: return "SuperSpeed";
+  case LIBUSB_SPEED_SUPER_PLUS: return "SuperSpeedPlus";
+  case LIBUSB_SPEED_SUPER_PLUS_X2: return "SuperSpeedPlusX2";
+  default: return "Unknown";
+  }
+}
+
 #ifdef _MSC_VER
 
 #define DELTA_EPOCH_IN_MICROSECS  116444736000000000Ui64
@@ -922,10 +1034,34 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
 
   int resubmit = 1;
 
+  /* ── 传输状态诊断计数器 ── */
+  static const char *status_names[] = {
+    "COMPLETED",   /* 0 */
+    "ERROR",       /* 1 */
+    "TIMED_OUT",   /* 2 */
+    "CANCELLED",   /* 3 */
+    "STALL",       /* 4 */
+    "NO_DEVICE",   /* 5 */
+    "OVERFLOW",    /* 6 */
+  };
+  const char *stname = (transfer->status >= 0 && transfer->status <= 6)
+    ? status_names[transfer->status] : "UNKNOWN";
+
   switch (transfer->status) {
   case LIBUSB_TRANSFER_COMPLETED:
     if (transfer->num_iso_packets == 0) {
-      /* This is a bulk mode transfer, so it just has one payload transfer */
+      /* Bulk mode: 检查 short packet (actual_length < requested length) */
+      if (transfer->actual_length < transfer->length) {
+        /* 设备发送 short packet 结束 payload — 可能是 FPGA stop_writing */
+        static int short_count = 0;
+        short_count++;
+        if (short_count <= 10 || short_count % 100 == 0) {
+          fprintf(stderr, "[libuvc] BULK short packet: actual=%d requested=%d (seq=%u, count=%d) "
+                  "— device ended transfer early\n",
+                  transfer->actual_length, transfer->length,
+                  strmh->seq, short_count);
+        }
+      }
       _uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
     } else {
       /* This is an isochronous mode transfer, so each packet has a payload transfer */
@@ -953,7 +1089,10 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_ERROR:
   case LIBUSB_TRANSFER_NO_DEVICE: {
     int i;
-    UVC_DEBUG("not retrying transfer, status = %d", transfer->status);
+    /* 非正常完成: 记录详细信息用于诊断 */
+    fprintf(stderr, "[libuvc] transfer %s: status=%d, endpoint=0x%02x, len=%d, actual=%d\n",
+            stname, transfer->status, transfer->endpoint,
+            transfer->length, transfer->actual_length);
     pthread_mutex_lock(&strmh->cb_mutex);
 
     /* Mark transfer as deleted. */
@@ -980,7 +1119,16 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_TIMED_OUT:
   case LIBUSB_TRANSFER_STALL:
   case LIBUSB_TRANSFER_OVERFLOW:
-    UVC_DEBUG("retrying transfer, status = %d", transfer->status);
+    /* 可恢复异常: 详细记录用于诊断 host/driver/线缆问题 */
+    {
+      static int retry_count = 0;
+      retry_count++;
+      if (retry_count <= 10 || retry_count % 100 == 0) {
+        fprintf(stderr, "[libuvc] transfer %s (retry): status=%d, len=%d, actual=%d (count=%d)\n",
+                stname, transfer->status, transfer->length,
+                transfer->actual_length, retry_count);
+      }
+    }
     break;
   }
   
@@ -1367,39 +1515,90 @@ uvc_error_t uvc_stream_start(
       (total_transfer_size * LIBUVC_NUM_TRANSFER_BUFS) / (double)ctrl->dwMaxVideoFrameSize
     );
   } else {
-    /* ── Bulk 模式传输大小策略 ──
+    /* ── Bulk 模式 + RAW_IO 优化 ──
      *
-     * 关键发现 (2026-07-14 笔记本 XHCI 实测):
-     *   1MB transfer → 10% 丢帧率 (每帧 10 个 transfer 边界 = 10 个丢包点)
-     *   10MB transfer → 4% 丢帧率 (每帧 1 个 transfer 边界 = 1 个丢包点)
-     *
-     * 原因: 每次 bulk transfer 完成 (被 short packet 截断或读满) 后, XHCI 需要
-     * 处理完成中断 → libusb 回调 → resubmit, 这段间隙里 FT602 FIFO (32KB) 无人
-     * 读取, 若 XHCI 调度抖动 > 0.16ms 则 FIFO 溢出 → FPGA 丢数据 → 开新帧。
-     *
-     * 结论: transfer 越大, 边界越少, 丢包越少。使用整帧 transfer (dwMaxPayloadTransferSize)
-     * 配合大量 buffer, 让 XHCI 调度队列始终有 pending transfer 减少间隙。
-     *
-     * 可选: LIBUVC_BULK_XFER_SIZE_OVERRIDE 宏可强制指定 transfer 大小 (不推荐)
+     * 策略 (参考《上位机 UVC 10MiB 大帧 Bulk 传输优化说明》):
+     *   1. 优先启用 WinUSB RAW_IO, 绕过普通排队层消除 ~4 MiB 边界空隙
+     *   2. transfer buffer 长度向上对齐到 endpoint wMaxPacketSize 整数倍
+     *   3. 数据处理使用 actual_length, 对齐的 padding 不作为有效数据
+     *   4. 保持 10 个异步 transfer 在途
+     *   5. RAW_IO 不可用时回退到普通模式并明确告警
      */
+    size_t payload_size = strmh->cur_ctrl.dwMaxPayloadTransferSize;
+    size_t bulk_xfer_size = payload_size;
+    struct uvc_raw_io_setup raw_io = {0};
+    int raw_rc;
+    uint8_t bulk_endpoint = format_desc->parent->bEndpointAddress;
+
 #ifdef LIBUVC_BULK_XFER_SIZE_OVERRIDE
-    size_t bulk_xfer_size = LIBUVC_BULK_XFER_SIZE_OVERRIDE;
-#else
-    size_t bulk_xfer_size = strmh->cur_ctrl.dwMaxPayloadTransferSize;
+    bulk_xfer_size = LIBUVC_BULK_XFER_SIZE_OVERRIDE;
 #endif
 
     _uvc_set_stream_interface_alt0(strmh, "bulk-before-start");
     _uvc_clear_stream_endpoint(strmh, "bulk-before-start");
 
+    /* ── 启动诊断: libusb 版本 + 设备速度 ── */
+    {
+      const struct libusb_version *v = libusb_get_version();
+      int dev_speed = libusb_get_device_speed(strmh->devh->usb_devh
+          ? libusb_get_device(strmh->devh->usb_devh) : NULL);
+      fprintf(stderr,
+        "[libuvc] ========== USB Environment ==========\n"
+        "[libuvc]   libusb version:    %u.%u.%u.%u\n"
+        "[libuvc]   API version:       0x%08X\n"
+        "[libuvc]   device speed:      %s (%d)\n"
+        "[libuvc]   bulk endpoint:     0x%02x\n",
+        v->major, v->minor, v->micro, v->nano,
+        (unsigned)LIBUSB_API_VERSION,
+        _uvc_speed_name(dev_speed), dev_speed,
+        bulk_endpoint);
+    }
+
+    /* ── 尝试启用 RAW_IO ── */
+    raw_rc = _uvc_setup_raw_io(strmh->devh->usb_devh, bulk_endpoint,
+                               bulk_xfer_size, &raw_io);
+
+    if (raw_rc == LIBUSB_SUCCESS) {
+      bulk_xfer_size = raw_io.submitted_transfer_length;
+      strmh->raw_io_enabled = 1;
+      strmh->bulk_endpoint = bulk_endpoint;
+      fprintf(stderr,
+        "[libuvc]   RAW_IO:            ENABLED\n"
+        "[libuvc]   max packet size:   %d bytes\n"
+        "[libuvc]   raw max transfer:  %d bytes (%.1f KB)\n"
+        "[libuvc]   aligned xfer size: %zu bytes (%.1f KB)\n",
+        raw_io.endpoint_max_packet,
+        raw_io.raw_io_max_transfer,
+        raw_io.raw_io_max_transfer / 1024.0,
+        bulk_xfer_size, bulk_xfer_size / 1024.0);
+    } else {
+      const char *reason = "unknown";
+      switch (raw_rc) {
+      case LIBUSB_ERROR_NOT_SUPPORTED: reason = "endpoint/libusb does not support RAW_IO"; break;
+      case LIBUSB_ERROR_OVERFLOW: reason = "aligned request > RAW_IO max transfer"; break;
+      case LIBUSB_ERROR_NO_DEVICE: reason = "no device"; break;
+      case LIBUSB_ERROR_INVALID_PARAM: reason = "invalid param"; break;
+      default: reason = libusb_error_name(raw_rc); break;
+      }
+      fprintf(stderr,
+        "[libuvc]   RAW_IO:            DISABLED (rc=%d, %s)\n"
+        "[libuvc]   Using normal WinUSB path — 4 MiB boundary gaps may occur\n",
+        raw_rc, reason);
+    }
+    fprintf(stderr, "[libuvc] ========================================\n");
+
+    /* ── 创建 transfer 池 ── */
     for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS;
         ++transfer_id) {
       transfer = libusb_alloc_transfer(0);
+      if (!transfer) { ret = UVC_ERROR_NO_MEM; goto fail; }
       strmh->transfers[transfer_id] = transfer;
       strmh->transfer_bufs[transfer_id] = malloc(bulk_xfer_size);
+      if (!strmh->transfer_bufs[transfer_id]) { ret = UVC_ERROR_NO_MEM; goto fail; }
       libusb_fill_bulk_transfer(transfer, strmh->devh->usb_devh,
-          format_desc->parent->bEndpointAddress,
+          bulk_endpoint,
           strmh->transfer_bufs[transfer_id],
-          bulk_xfer_size, _uvc_stream_callback,
+          (int)bulk_xfer_size, _uvc_stream_callback,
           (void*) strmh, 5000 );
     }
 
@@ -1751,6 +1950,18 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
   pthread_mutex_unlock(&strmh->cb_mutex);
 
   _uvc_clear_stream_endpoint(strmh, "after-stop");
+
+  /* RAW_IO pipe policy must not be modified while transfers are active.
+   * All transfers have been cancelled and freed above, so it's safe now. */
+#ifdef UVC_ENABLE_RAW_IO
+  if (strmh->raw_io_enabled && strmh->devh && strmh->devh->usb_devh) {
+    int rc = libusb_endpoint_set_raw_io(strmh->devh->usb_devh,
+                                        strmh->bulk_endpoint, 0);
+    fprintf(stderr, "[libuvc] RAW_IO disabled on endpoint 0x%02x (rc=%d)\n",
+            strmh->bulk_endpoint, rc);
+    strmh->raw_io_enabled = 0;
+  }
+#endif
 
   /** @todo stop the actual stream, camera side? */
 

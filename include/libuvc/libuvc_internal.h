@@ -248,6 +248,8 @@ struct uvc_stream_handle {
   uint8_t fid;
   uint8_t is_bulk;            /** 1 = bulk transfer mode, 0 = isochronous */
   uint8_t bulk_hdr_done;      /** BULK: frame header already seen, remaining xfers are raw data */
+  uint8_t raw_io_enabled;     /** 1 = WinUSB RAW_IO is enabled on this endpoint */
+  uint8_t bulk_endpoint;      /** Bulk IN endpoint address (for RAW_IO cleanup) */
   uint32_t seq, hold_seq;
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;
