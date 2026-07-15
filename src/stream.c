@@ -1724,6 +1724,12 @@ uvc_error_t uvc_stream_start_iso(
 void *_uvc_user_caller(void *arg) {
   uvc_stream_handle_t *strmh = (uvc_stream_handle_t *) arg;
 
+#ifdef _WIN32
+  /* Boost callback thread priority for faster frame processing and
+   * reduced USB event loop backpressure. */
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+
   uint32_t last_seq = 0;
 
   do {
