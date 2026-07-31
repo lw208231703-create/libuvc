@@ -1484,9 +1484,9 @@ uvc_error_t uvc_stream_start(
       libusb_fill_iso_transfer(
         transfer, strmh->devh->usb_devh, format_desc->parent->bEndpointAddress,
         strmh->transfer_bufs[transfer_id],
-        total_transfer_size, packets_per_transfer, _uvc_stream_callback, (void*) strmh, 5000);
+        (int)total_transfer_size, packets_per_transfer, _uvc_stream_callback, (void*) strmh, 5000);
 
-      libusb_set_iso_packet_lengths(transfer, endpoint_bytes_per_packet);
+      libusb_set_iso_packet_lengths(transfer, (unsigned int)endpoint_bytes_per_packet);
     }
 
     /* ── 诊断日志：打印流启动参数 ── */
@@ -1860,7 +1860,7 @@ uvc_error_t uvc_stream_get_frame(uvc_stream_handle_t *strmh,
 #endif
 
       ts.tv_sec += add_secs;
-      ts.tv_nsec += add_nsecs;
+      ts.tv_nsec += (long)add_nsecs;
 
       /* pthread_cond_timedwait FAILS with EINVAL if ts.tv_nsec > 1000000000 (1 billion)
        * Since we are just adding values to the timespec, we have to increment the seconds if nanoseconds is greater than 1 billion,
